@@ -7,6 +7,7 @@ from helpers import test_pptx
 
 from pptx import Presentation
 from pptx.enum.chart import XL_DATA_LABEL_POSITION
+from pptx.text.text import Font
 
 # given ===================================================
 
@@ -135,7 +136,7 @@ def when_I_assign_value_to_data_labels_show_value(context, value):
 @then("data_label.font is a Font object")
 def then_data_label_font_is_a_Font_object(context):
     font = context.data_label.font
-    assert type(font).__name__ == "Font"
+    assert isinstance(font, Font)
 
 
 @then("data_label.has_text_frame is {value}")

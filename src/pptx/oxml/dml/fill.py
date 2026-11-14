@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Callable
+
 from pptx.enum.dml import MSO_PATTERN_TYPE
 from pptx.oxml import parse_xml
 from pptx.oxml.ns import nsdecls
@@ -20,6 +22,9 @@ from pptx.oxml.xmlchemy import (
     ZeroOrOne,
     ZeroOrOneChoice,
 )
+
+if TYPE_CHECKING:
+    from pptx.oxml.dml.color import CT_SchemeColor, CT_SRgbColor
 
 
 class CT_Blip(BaseOxmlElement):
@@ -183,6 +188,9 @@ class CT_RelativeRect(BaseOxmlElement):
 
 class CT_SolidColorFillProperties(BaseOxmlElement):
     """`a:solidFill` custom element class."""
+
+    get_or_change_to_schemeClr: Callable[[], CT_SchemeColor]
+    get_or_change_to_srgbClr: Callable[[], CT_SRgbColor]
 
     eg_colorChoice = ZeroOrOneChoice(
         (

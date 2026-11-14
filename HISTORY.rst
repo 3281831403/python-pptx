@@ -3,6 +3,22 @@
 Release History
 ---------------
 
+Next release
+++++++++++++
+
+- Paragraph-level font reads fall back to `a:endParaRPr` (paragraph-mark
+  formatting) when `a:defRPr` specifies no value, so e.g. `paragraph.font.size`
+  reflects formatting applied only to the paragraph mark, including sizes
+  applied by `TextFrame.fit_text()`.
+- Read-only access to `paragraph.font` (and `Font.color`) no longer adds
+  elements to the XML; in particular a gradient font color is no longer
+  converted to a solid fill on read.
+- Writes via `paragraph.font` go to `a:defRPr` and remove any contradicting
+  value from `a:endParaRPr`.
+- Assigning to `TextFrame.text`, `_Paragraph.text`, or `_Cell.text` preserves
+  each paragraph's properties (e.g. indentation level) and explicit character
+  formatting; added paragraphs follow the last prior paragraph.
+
 1.0.2 (2024-08-07)
 ++++++++++++++++++
 

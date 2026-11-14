@@ -14,7 +14,7 @@ from pptx.enum.text import (
 )
 from pptx.exc import InvalidXmlError
 from pptx.oxml import parse_xml
-from pptx.oxml.dml.fill import CT_GradientFillProperties
+from pptx.oxml.dml.fill import CT_GradientFillProperties, CT_SolidColorFillProperties
 from pptx.oxml.ns import nsdecls
 from pptx.oxml.simpletypes import (
     ST_Coordinate32,
@@ -268,10 +268,17 @@ class CT_TextCharacterProperties(BaseOxmlElement):
 
     get_or_add_hlinkClick: Callable[[], CT_Hyperlink]
     get_or_add_latin: Callable[[], CT_TextFont]
+    get_or_change_to_blipFill: Callable[[], BaseOxmlElement]
+    get_or_change_to_gradFill: Callable[[], CT_GradientFillProperties]
+    get_or_change_to_grpFill: Callable[[], BaseOxmlElement]
+    get_or_change_to_noFill: Callable[[], BaseOxmlElement]
+    get_or_change_to_pattFill: Callable[[], BaseOxmlElement]
+    get_or_change_to_solidFill: Callable[[], CT_SolidColorFillProperties]
+    _remove_eg_fillProperties: Callable[[], None]
     _remove_latin: Callable[[], None]
     _remove_hlinkClick: Callable[[], None]
 
-    eg_fillProperties = ZeroOrOneChoice(
+    eg_fillProperties: BaseOxmlElement | None = ZeroOrOneChoice(  # pyright: ignore[reportAssignmentType]
         (
             Choice("a:noFill"),
             Choice("a:solidFill"),
@@ -373,7 +380,9 @@ class CT_TextLineBreak(BaseOxmlElement):
 
     get_or_add_rPr: Callable[[], CT_TextCharacterProperties]
 
-    rPr = ZeroOrOne("a:rPr", successors=())
+    rPr: CT_TextCharacterProperties | None = ZeroOrOne(  # pyright: ignore[reportAssignmentType]
+        "a:rPr", successors=()
+    )
 
     @property
     def text(self):  # pyright: ignore[reportIncompatibleMethodOverride]

@@ -8,8 +8,9 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from pptx.dml.color import ColorFormat
+from pptx.dml.color import ColorFormat, RGBColor
 from pptx.dml.fill import FillFormat
+from pptx.enum.dml import MSO_FILL
 from pptx.enum.lang import MSO_LANGUAGE_ID
 from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE, MSO_UNDERLINE, PP_ALIGN
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
@@ -347,6 +348,15 @@ class DescribeTextFrame(object):
                 "p:txBody/a:p/(a:fld/a:rPr{sz=600,b=1,i=0}/a:latin{typeface=F},a:en"
                 "dParaRPr{sz=600,b=1,i=0}/a:latin{typeface=F})",
             ),
+            # ---an existing defRPr is updated, not created when absent---
+            (
+                "p:txBody/(a:bodyPr,a:p/(a:pPr/a:defRPr{sz=999},a:r))",
+                True,
+                False,
+                "p:txBody/(a:bodyPr,a:p/(a:pPr/a:defRPr{sz=600,b=1,i=0}/a:latin{typ"
+                "eface=F},a:r/a:rPr{sz=600,b=1,i=0}/a:latin{typeface=F},a:endParaR"
+                "Pr{sz=600,b=1,i=0}/a:latin{typeface=F}))",
+            ),
         ]
     )
     def set_font_fixture(self, request):
@@ -406,6 +416,34 @@ class DescribeTextFrame(object):
             ('p:txBody/a:p/a:r/a:t"foobar"', "", "p:txBody/a:p"),
             # ---vertical-tab becomes line-break---
             ("p:txBody/a:p", "a\vb", 'p:txBody/a:p/(a:r/a:t"a",a:br,a:r/a:t"b")'),
+            # ---paragraph properties are preserved---
+            (
+                'p:txBody/(a:bodyPr,a:p/(a:pPr{lvl=1},a:r/a:t"foo"))',
+                "a\nb",
+                'p:txBody/(a:bodyPr,a:p/(a:pPr{lvl=1},a:r/a:t"a"),a:p/(a:pPr{lvl=1},'
+                'a:r/a:t"b"))',
+            ),
+            # ---explicit paragraph character formatting is preserved per paragraph---
+            (
+                "p:txBody/(a:bodyPr,a:p/(a:pPr/a:defRPr{sz=1800},a:r/a:t\"foo\"),a:p/("
+                'a:pPr/a:defRPr{sz=2400},a:r/a:t"bar"))',
+                "a\nb",
+                "p:txBody/(a:bodyPr,a:p/(a:pPr/a:defRPr{sz=1800},a:r/a:t\"a\"),a:p/(a:"
+                'pPr/a:defRPr{sz=2400},a:r/a:t"b"))',
+            ),
+            # ---added paragraphs inherit the last paragraph's explicit formatting---
+            (
+                'p:txBody/(a:bodyPr,a:p/a:r/(a:rPr{b=1},a:t"foo"))',
+                "a\nb",
+                'p:txBody/(a:bodyPr,a:p/(a:pPr/a:defRPr{b=1},a:r/a:t"a"),a:p/(a:pPr/a:'
+                'defRPr{b=1},a:r/a:t"b"))',
+            ),
+            # ---removed paragraphs leave the remaining paragraph properties intact---
+            (
+                'p:txBody/(a:bodyPr,a:p/(a:pPr{lvl=1},a:r/a:t"foo"),a:p/a:r/a:t"bar")',
+                "baz",
+                'p:txBody/(a:bodyPr,a:p/(a:pPr{lvl=1},a:r/a:t"baz"))',
+            ),
         ]
     )
     def text_set_fixture(self, request):
@@ -530,6 +568,25 @@ class DescribeFont(object):
 
     def it_provides_access_to_its_fill(self, font):
         assert isinstance(font.fill, FillFormat)
+
+    def it_does_not_add_a_fill_when_its_color_is_only_read(self):
+        rPr = element("a:rPr")
+        font = Font(rPr)
+        assert font.color.type is None
+        assert rPr.xml == xml("a:rPr")
+
+    def it_adds_a_solid_fill_only_when_a_color_value_is_assigned(self):
+        rPr = element("a:rPr")
+        font = Font(rPr)
+        font.color.rgb = RGBColor(0x12, 0x34, 0x56)
+        assert rPr.xml == xml("a:rPr/a:solidFill/a:srgbClr{val=123456}")
+
+    def it_does_not_convert_a_gradient_fill_to_solid_when_color_is_read(self):
+        rPr = element("a:rPr/a:gradFill")
+        font = Font(rPr)
+        with pytest.raises(TypeError):
+            font.color
+        assert rPr.xml == xml("a:rPr/a:gradFill")
 
     # fixtures ---------------------------------------------
 
@@ -812,10 +869,19 @@ class Describe_Paragraph(object):
         paragraph.clear()
         assert paragraph._element.xml == expected_xml
 
-    def it_provides_access_to_the_default_paragraph_font(self, paragraph, Font_):
+    def it_provides_access_to_the_default_paragraph_font(self, paragraph):
         font = paragraph.font
-        Font_.assert_called_once_with(paragraph._defRPr)
-        assert font == Font_.return_value
+        assert isinstance(font, Font)
+
+    def it_does_not_add_elements_when_its_font_is_only_read(self, paragraph):
+        font = paragraph.font
+        # ---read every font attribute---
+        font.bold, font.italic, font.language_id, font.name, font.size, font.underline
+        font.fill.type
+        font.color.type
+        # ---no pPr, defRPr, or endParaRPr elements are added by read-only access---
+        assert paragraph._p.pPr is None
+        assert paragraph._p.endParaRPr is None
 
     def it_knows_its_indentation_level(self, level_get_fixture):
         paragraph, expected_value = level_get_fixture
@@ -887,6 +953,33 @@ class Describe_Paragraph(object):
                 "utf-8 unicode: Hér er texti",
                 'a:p/a:r/a:t"utf-8 unicode: Hér er texti"',
             ),
+            # ---defRPr character formatting is retained by replacement text---
+            (
+                'a:p/(a:pPr/a:defRPr{sz=2400},a:r/a:t"foo")',
+                "bar",
+                'a:p/(a:pPr/a:defRPr{sz=2400},a:r/a:t"bar")',
+            ),
+            # ---paragraph-mark (endParaRPr) formatting is promoted to defRPr---
+            (
+                'a:p/(a:r/a:t"foo",a:endParaRPr{sz=1800,b=1})',
+                "bar",
+                'a:p/(a:pPr/a:defRPr{sz=1800,b=1},a:r/a:t"bar",a:endParaRPr{sz=1800,'
+                "b=1})",
+            ),
+            # ---run-level formatting is promoted to defRPr---
+            (
+                'a:p/a:r/(a:rPr{b=1},a:t"foo")',
+                "bar",
+                'a:p/(a:pPr/a:defRPr{b=1},a:r/a:t"bar")',
+            ),
+            # ---run-level typeface is promoted to defRPr---
+            (
+                'a:p/a:r/(a:rPr/a:latin{typeface=F},a:t"foo")',
+                "bar",
+                'a:p/(a:pPr/a:defRPr/a:latin{typeface=F},a:r/a:t"bar")',
+            ),
+            # ---an empty endParaRPr carries no formatting to promote---
+            ("a:p/a:endParaRPr", "foo", 'a:p/(a:r/a:t"foo",a:endParaRPr)'),
         ],
     )
     def it_can_change_its_text(self, p_cxml: str, value: str, expected_cxml: str):
@@ -1122,10 +1215,6 @@ class Describe_Paragraph(object):
     # fixture components -----------------------------------
 
     @pytest.fixture
-    def Font_(self, request):
-        return class_mock(request, "pptx.text.text.Font")
-
-    @pytest.fixture
     def p_bldr(self):
         return a_p().with_nsdecls()
 
@@ -1137,6 +1226,202 @@ class Describe_Paragraph(object):
     @pytest.fixture
     def paragraph(self, p_bldr):
         return _Paragraph(p_bldr.element, None)
+
+
+class Describe_ParagraphFont(object):
+    """Unit-test suite for paragraph-level font (`pptx.text.text._ParagraphFont`)."""
+
+    @pytest.mark.parametrize(
+        ("p_cxml", "attr", "expected_value"),
+        [
+            # ---no explicit formatting reads as inherited, not created---
+            ("a:p", "size", None),
+            ("a:p", "bold", None),
+            ("a:p", "italic", None),
+            ("a:p", "underline", None),
+            ("a:p", "name", None),
+            ("a:p", "language_id", MSO_LANGUAGE_ID.NONE),
+            # ---formatting applied only to the paragraph mark is read---
+            ("a:p/a:endParaRPr{sz=1800}", "size", Pt(18)),
+            ("a:p/a:endParaRPr{b=1}", "bold", True),
+            ("a:p/a:endParaRPr{b=0}", "bold", False),
+            ("a:p/a:endParaRPr{i=1}", "italic", True),
+            ("a:p/a:endParaRPr{u=sng}", "underline", True),
+            ("a:p/a:endParaRPr{u=none}", "underline", False),
+            ("a:p/a:endParaRPr{u=dbl}", "underline", MSO_UNDERLINE.DOUBLE_LINE),
+            ("a:p/a:endParaRPr{lang=pl-PL}", "language_id", MSO_LANGUAGE_ID.POLISH),
+            ("a:p/a:endParaRPr/a:latin{typeface=Foobar}", "name", "Foobar"),
+            # ---defRPr is authoritative when both are written---
+            ("a:p/(a:pPr/a:defRPr{sz=2400},a:endParaRPr{sz=1800})", "size", Pt(24)),
+            ("a:p/(a:pPr/a:defRPr{b=1},a:endParaRPr{b=0})", "bold", True),
+            # ---attributes not on defRPr fall back to endParaRPr---
+            ("a:p/(a:pPr/a:defRPr{b=1},a:endParaRPr{sz=1800})", "size", Pt(18)),
+            ("a:p/(a:pPr/a:defRPr{b=1},a:endParaRPr{sz=1800})", "bold", True),
+        ],
+    )
+    def it_reads_explicit_char_format(self, p_cxml, attr, expected_value):
+        paragraph = _Paragraph(element(p_cxml), None)
+        assert getattr(paragraph.font, attr) == expected_value
+
+    @pytest.mark.parametrize(
+        ("p_cxml", "attr", "value", "expected_cxml"),
+        [
+            # ---a written value is added to defRPr---
+            ("a:p", "bold", True, "a:p/a:pPr/a:defRPr{b=1}"),
+            ("a:p", "italic", True, "a:p/a:pPr/a:defRPr{i=1}"),
+            ("a:p", "size", Pt(24), "a:p/a:pPr/a:defRPr{sz=2400}"),
+            ("a:p", "underline", True, "a:p/a:pPr/a:defRPr{u=sng}"),
+            ("a:p", "name", "Foobar", "a:p/a:pPr/a:defRPr/a:latin{typeface=Foobar}"),
+            (
+                "a:p",
+                "language_id",
+                MSO_LANGUAGE_ID.POLISH,
+                "a:p/a:pPr/a:defRPr{lang=pl-PL}",
+            ),
+            # ---a written value removes any contradicting endParaRPr value---
+            (
+                "a:p/a:endParaRPr{sz=1800}",
+                "size",
+                Pt(24),
+                "a:p/(a:pPr/a:defRPr{sz=2400},a:endParaRPr)",
+            ),
+            (
+                "a:p/a:endParaRPr{b=1}",
+                "bold",
+                False,
+                "a:p/(a:pPr/a:defRPr{b=0},a:endParaRPr)",
+            ),
+            (
+                "a:p/a:endParaRPr{u=sng}",
+                "underline",
+                None,
+                "a:p/a:endParaRPr",
+            ),
+            (
+                "a:p/a:endParaRPr{lang=pl-PL}",
+                "language_id",
+                MSO_LANGUAGE_ID.NONE,
+                "a:p/a:endParaRPr",
+            ),
+            (
+                "a:p/a:endParaRPr/a:latin{typeface=Foobar}",
+                "name",
+                "Barfoo",
+                "a:p/(a:pPr/a:defRPr/a:latin{typeface=Barfoo},a:endParaRPr)",
+            ),
+            (
+                "a:p/(a:pPr/a:defRPr{sz=2400},a:endParaRPr{sz=1800})",
+                "size",
+                Pt(12),
+                "a:p/(a:pPr/a:defRPr{sz=1200},a:endParaRPr)",
+            ),
+            # ---assigning None removes the setting without creating elements---
+            ("a:p", "bold", None, "a:p"),
+            ("a:p", "size", None, "a:p"),
+            ("a:p", "name", None, "a:p"),
+            ("a:p/a:endParaRPr{b=1}", "bold", None, "a:p/a:endParaRPr"),
+            (
+                "a:p/(a:pPr/a:defRPr{sz=2400},a:endParaRPr{sz=1800})",
+                "size",
+                None,
+                "a:p/(a:pPr/a:defRPr,a:endParaRPr)",
+            ),
+        ],
+    )
+    def it_writes_explicit_char_format(self, p_cxml, attr, value, expected_cxml):
+        p = element(p_cxml)
+        paragraph = _Paragraph(p, None)
+        setattr(paragraph.font, attr, value)
+        assert p.xml == xml(expected_cxml)
+
+    def it_does_not_change_the_xml_when_only_read(self):
+        p = element("a:p")
+        paragraph = _Paragraph(p, None)
+        font = paragraph.font
+        font.bold, font.italic, font.language_id, font.name, font.size, font.underline
+        font.fill.type
+        font.color.type
+        assert p.xml == xml("a:p")
+
+    def it_does_not_add_defRPr_when_reading_format_from_endParaRPr(self):
+        p = element("a:p/a:endParaRPr{sz=1800}")
+        paragraph = _Paragraph(p, None)
+        assert paragraph.font.size == Pt(18)
+        assert p.xml == xml("a:p/a:endParaRPr{sz=1800}")
+
+    def it_reads_the_font_size_applied_by_fit_text(self):
+        text_frame = TextFrame(element('p:txBody/(a:bodyPr,a:p/a:r/a:t"foo")'), None)
+        text_frame._set_font("F", 6, True, False)
+        paragraph = text_frame.paragraphs[0]
+        assert paragraph.font.size == Pt(6)
+        assert paragraph.font.bold is True
+        assert paragraph.font.italic is False
+        assert paragraph.font.name == "F"
+
+    def it_reads_the_fit_text_size_when_defRPr_is_present(self):
+        txBody_cxml = 'p:txBody/(a:bodyPr,a:p/(a:pPr/a:defRPr{sz=2400},a:r/a:t"foo"))'
+        text_frame = TextFrame(element(txBody_cxml), None)
+        text_frame._set_font("F", 6, True, False)
+        assert text_frame.paragraphs[0].font.size == Pt(6)
+
+    def it_reads_fill_from_endParaRPr_when_defRPr_has_none(self):
+        p_cxml = "a:p/(a:pPr/a:defRPr{sz=2400},a:endParaRPr/a:gradFill)"
+        paragraph = _Paragraph(element(p_cxml), None)
+        assert paragraph.font.fill.type == MSO_FILL.GRADIENT
+
+    def it_does_not_convert_a_gradient_fill_to_solid_when_color_is_read(self):
+        p = element("a:p/a:pPr/a:defRPr/a:gradFill")
+        paragraph = _Paragraph(p, None)
+        with pytest.raises(TypeError):
+            paragraph.font.color
+        assert p.xml == xml("a:p/a:pPr/a:defRPr/a:gradFill")
+
+    def it_reports_no_color_type_when_no_fill_is_specified(self):
+        p = element("a:p")
+        paragraph = _Paragraph(p, None)
+        assert paragraph.font.color.type is None
+        assert p.xml == xml("a:p")
+
+    def it_reads_color_from_an_endParaRPr_solid_fill(self):
+        p_cxml = "a:p/a:endParaRPr/a:solidFill/a:srgbClr{val=FF6600}"
+        paragraph = _Paragraph(element(p_cxml), None)
+        assert paragraph.font.color.rgb == RGBColor(0xFF, 0x66, 0x00)
+
+    def it_materializes_a_solid_fill_on_defRPr_when_a_color_is_assigned(self):
+        p = element("a:p")
+        paragraph = _Paragraph(p, None)
+        paragraph.font.color.rgb = RGBColor(0x12, 0x34, 0x56)
+        assert p.xml == xml("a:p/a:pPr/a:defRPr/a:solidFill/a:srgbClr{val=123456}")
+
+    def it_removes_an_endParaRPr_fill_when_the_fill_is_written(self):
+        p = element("a:p/a:endParaRPr/a:solidFill/a:srgbClr{val=FF6600}")
+        paragraph = _Paragraph(p, None)
+        paragraph.font.fill.background()
+        assert p.xml == xml("a:p/(a:pPr/a:defRPr/a:noFill,a:endParaRPr)")
+
+    def it_round_trips_paragraph_font_settings_through_save_and_reload(self, tmp_path):
+        from pptx import Presentation
+
+        prs = Presentation()
+        textbox = prs.slides.add_slide(prs.slide_layouts[6]).shapes.add_textbox(
+            Inches(1), Inches(1), Inches(2), Inches(1)
+        )
+        paragraph = textbox.text_frame.paragraphs[0]
+        paragraph.text = "Weekly Report"
+        paragraph.font.size = Pt(28)
+        paragraph.font.bold = True
+        # ---a second paragraph formatted only on its paragraph mark---
+        mark_paragraph = textbox.text_frame.add_paragraph()
+        mark_paragraph.text = "section"
+        mark_paragraph._p.get_or_add_endParaRPr().sz = 1400
+
+        path = str(tmp_path / "round-trip.pptx")
+        prs.save(path)
+
+        paragraphs = Presentation(path).slides[0].shapes[0].text_frame.paragraphs
+        assert paragraphs[0].font.size == Pt(28)
+        assert paragraphs[0].font.bold is True
+        assert paragraphs[1].font.size == Pt(14)
 
 
 class Describe_Run(object):

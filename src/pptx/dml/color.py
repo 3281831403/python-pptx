@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from pptx.enum.dml import MSO_COLOR_TYPE, MSO_THEME_COLOR
 from pptx.oxml.dml.color import (
     CT_HslColor,
@@ -19,7 +21,7 @@ class ColorFormat(object):
     luminance adjustments.
     """
 
-    def __init__(self, eg_colorChoice_parent, color):
+    def __init__(self, eg_colorChoice_parent: Any, color: _Color):
         super(ColorFormat, self).__init__()
         self._xFill = eg_colorChoice_parent
         self._color = color
@@ -39,7 +41,7 @@ class ColorFormat(object):
         self._color.brightness = value
 
     @classmethod
-    def from_colorchoice_parent(cls, eg_colorChoice_parent):
+    def from_colorchoice_parent(cls, eg_colorChoice_parent: Any) -> ColorFormat:
         xClr = eg_colorChoice_parent.eg_colorChoice
         color = _Color(xClr)
         color_format = cls(eg_colorChoice_parent, color)

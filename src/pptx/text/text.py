@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import copy
 from typing import TYPE_CHECKING, Iterator, cast
 
+from pptx.dml.color import ColorFormat
 from pptx.dml.fill import FillFormat
-from pptx.enum.dml import MSO_FILL
 from pptx.enum.lang import MSO_LANGUAGE_ID
 from pptx.enum.text import MSO_AUTO_SIZE, MSO_UNDERLINE, MSO_VERTICAL_ANCHOR
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+from pptx.oxml.dml.fill import CT_SolidColorFillProperties
 from pptx.oxml.simpletypes import ST_TextWrappingType
 from pptx.shapes import Subshape
 from pptx.text.fonts import FontFiles
@@ -16,13 +18,13 @@ from pptx.text.layout import TextFitter
 from pptx.util import Centipoints, Emu, Length, Pt, lazyproperty
 
 if TYPE_CHECKING:
-    from pptx.dml.color import ColorFormat
     from pptx.enum.text import (
         MSO_TEXT_UNDERLINE_TYPE,
         MSO_VERTICAL_ANCHOR,
         PP_PARAGRAPH_ALIGNMENT,
     )
     from pptx.oxml.action import CT_Hyperlink
+    from pptx.oxml.dml.color import CT_SchemeColor, CT_SRgbColor
     from pptx.oxml.text import (
         CT_RegularTextRun,
         CT_TextBody,
@@ -30,6 +32,7 @@ if TYPE_CHECKING:
         CT_TextParagraph,
         CT_TextParagraphProperties,
     )
+    from pptx.oxml.xmlchemy import BaseOxmlElement
     from pptx.types import ProvidesExtents, ProvidesPart
 
 
@@ -164,6 +167,11 @@ class TextFrame(Subshape):
         character (`"\\n"`) encountered. A line-break (soft carriage-return) is inserted for each
         vertical-tab character (`"\\v"`) encountered.
 
+        Each paragraph in the new text is matched with the paragraph at the same position in the
+        prior content; that paragraph's properties (such as indentation level) and its explicit
+        character formatting are retained, so replaced text keeps the appearance it had. Paragraphs
+        beyond the number previously present take their properties from the last prior paragraph.
+
         Any control character other than newline, tab, or vertical-tab are escaped as plain-text
         like "_x001B_" (for ESC (ASCII 32) in this example).
         """
@@ -172,10 +180,24 @@ class TextFrame(Subshape):
     @text.setter
     def text(self, text: str):
         txBody = self._txBody
-        txBody.clear_content()
-        for p_text in text.split("\n"):
-            p = txBody.add_p()
-            p.append_text(p_text)
+        p_texts = text.split("\n")
+        old_ps = list(txBody.p_lst)
+        # ---remove paragraphs in excess of those required by the new text---
+        for p in old_ps[len(p_texts) :]:
+            txBody.remove(p)
+        for idx, p_text in enumerate(p_texts):
+            if idx < len(old_ps):
+                # ---reuse an existing paragraph so its properties are preserved---
+                p = old_ps[idx]
+            else:
+                # ---a further paragraph takes its properties from the last prior one---
+                p = txBody.add_p()
+                last_pPr = old_ps[-1].pPr if old_ps else None
+                if last_pPr is not None:
+                    p.insert_element_before(
+                        copy.deepcopy(last_pPr), "a:r", "a:br", "a:fld", "a:endParaRPr"
+                    )
+            _Paragraph(p, self).text = p_text
 
     @property
     def vertical_anchor(self) -> MSO_VERTICAL_ANCHOR | None:
@@ -263,6 +285,11 @@ class TextFrame(Subshape):
             for p in txBody.p_lst:
                 for elm in p.content_children:
                     yield elm.get_or_add_rPr()
+                # ---update an explicit paragraph default when one is present, so the---
+                # ---fitted size is also reflected at the paragraph level---
+                pPr = p.pPr
+                if pPr is not None and pPr.defRPr is not None:
+                    yield pPr.defRPr
                 # generate a:endParaRPr for each <a:p> element
                 yield p.get_or_add_endParaRPr()
 
@@ -304,9 +331,16 @@ class Font(object):
 
     @lazyproperty
     def color(self) -> ColorFormat:
-        """The |ColorFormat| instance that provides access to the color settings for this font."""
-        if self.fill.type != MSO_FILL.SOLID:
-            self.fill.solid()
+        """The |ColorFormat| instance that provides access to the color settings for this font.
+
+        Accessing this property never changes the XML. When no fill is specified on the run
+        properties, the returned object reports a color type of |None| and an `a:solidFill`
+        element is only added if and when a color value is assigned. When the font has a
+        non-solid fill, such as a gradient, a |TypeError| is raised; use :attr:`fill` to
+        access the fill in that case.
+        """
+        if self._rPr.eg_fillProperties is None:
+            return ColorFormat.from_colorchoice_parent(_DeferredSolidFill(self._rPr))
         return self.fill.fore_color
 
     @lazyproperty
@@ -422,6 +456,302 @@ class Font(object):
         self._element.u = value
 
 
+class _DeferredSolidFill:
+    """`EG_ColorChoice` parent that stands in for an `a:solidFill` element not yet present.
+
+    Allows the font color to be read when no fill is specified without adding any elements
+    to the XML. The `a:solidFill` element is materialized on *fill_parent* (an element
+    having the `EG_FillProperties` child group, or a proxy for one) only when a color value
+    is assigned.
+    """
+
+    def __init__(self, fill_parent: CT_TextCharacterProperties | _ParagraphFillParent):
+        super(_DeferredSolidFill, self).__init__()
+        self._fill_parent = fill_parent
+
+    @property
+    def eg_colorChoice(self) -> BaseOxmlElement | None:
+        """Color-choice child of the solid fill, None when no solid fill is present."""
+        solidFill = self._solidFill
+        if solidFill is None:
+            return None
+        return cast("BaseOxmlElement | None", solidFill.eg_colorChoice)
+
+    def get_or_change_to_schemeClr(self) -> CT_SchemeColor:
+        """Return the `a:schemeClr` child of the solid fill, added as needed."""
+        return self._get_or_add_solidFill().get_or_change_to_schemeClr()
+
+    def get_or_change_to_srgbClr(self) -> CT_SRgbColor:
+        """Return the `a:srgbClr` child of the solid fill, added as needed."""
+        return self._get_or_add_solidFill().get_or_change_to_srgbClr()
+
+    def _get_or_add_solidFill(self) -> CT_SolidColorFillProperties:
+        """The `a:solidFill` element of the fill parent, materialized if not present."""
+        solidFill = self._solidFill
+        if solidFill is not None:
+            return solidFill
+        return self._fill_parent.get_or_change_to_solidFill()
+
+    @property
+    def _solidFill(self) -> CT_SolidColorFillProperties | None:
+        """The `a:solidFill` child of the fill parent, None when a different or no fill is set."""
+        fill = self._fill_parent.eg_fillProperties
+        if isinstance(fill, CT_SolidColorFillProperties):
+            return fill
+        return None
+
+
+class _ParagraphFillParent:
+    """`EG_FillProperties` parent view over a paragraph's explicit character properties.
+
+    A fill is read from `a:pPr/a:defRPr` when one is specified there, otherwise from
+    `a:endParaRPr`; no elements are added to the XML for reading. A fill-changing method
+    applies the change to `a:defRPr` (added as needed) and removes any fill from
+    `a:endParaRPr`, so the two cannot hold contradicting values.
+    """
+
+    def __init__(self, p: CT_TextParagraph):
+        super(_ParagraphFillParent, self).__init__()
+        self._p = p
+
+    @property
+    def eg_fillProperties(self) -> BaseOxmlElement | None:
+        """Fill element of `a:defRPr`, or of `a:endParaRPr` when defRPr specifies none."""
+        for rPr in (self._defRPr, self._p.endParaRPr):
+            if rPr is not None:
+                fill = rPr.eg_fillProperties
+                if fill is not None:
+                    return fill
+        return None
+
+    def get_or_change_to_blipFill(self) -> BaseOxmlElement:
+        return self._change_fill_to("blipFill")
+
+    def get_or_change_to_gradFill(self) -> BaseOxmlElement:
+        return self._change_fill_to("gradFill")
+
+    def get_or_change_to_grpFill(self) -> BaseOxmlElement:
+        return self._change_fill_to("grpFill")
+
+    def get_or_change_to_noFill(self) -> BaseOxmlElement:
+        return self._change_fill_to("noFill")
+
+    def get_or_change_to_pattFill(self) -> BaseOxmlElement:
+        return self._change_fill_to("pattFill")
+
+    def get_or_change_to_solidFill(self) -> CT_SolidColorFillProperties:
+        return cast(CT_SolidColorFillProperties, self._change_fill_to("solidFill"))
+
+    def _change_fill_to(self, fill_tag: str) -> BaseOxmlElement:
+        """Return the `a:{fill_tag}` child of `a:defRPr`, added or changed-to as needed.
+
+        Any fill on `a:endParaRPr` is removed so it cannot contradict the new value.
+        """
+        defRPr = self._get_or_add_defRPr()
+        endParaRPr = self._p.endParaRPr
+        if endParaRPr is not None:
+            endParaRPr._remove_eg_fillProperties()  # pyright: ignore[reportPrivateUsage]
+        change_to = {
+            "blipFill": defRPr.get_or_change_to_blipFill,
+            "gradFill": defRPr.get_or_change_to_gradFill,
+            "grpFill": defRPr.get_or_change_to_grpFill,
+            "noFill": defRPr.get_or_change_to_noFill,
+            "pattFill": defRPr.get_or_change_to_pattFill,
+            "solidFill": defRPr.get_or_change_to_solidFill,
+        }[fill_tag]
+        return change_to()
+
+    @property
+    def _defRPr(self) -> CT_TextCharacterProperties | None:
+        """The `a:defRPr` child of this paragraph's `a:pPr`, None when not present."""
+        pPr = self._p.pPr
+        if pPr is None:
+            return None
+        return pPr.defRPr
+
+    def _get_or_add_defRPr(self) -> CT_TextCharacterProperties:
+        """The `a:defRPr` element for this paragraph, added with its ancestors as needed."""
+        return self._p.get_or_add_pPr().get_or_add_defRPr()
+
+
+class _ParagraphFont(Font):
+    """|Font| subclass bound to the default character properties of a paragraph.
+
+    Values are read from `a:pPr/a:defRPr` when present, falling back to `a:endParaRPr`
+    (character formatting applied to the paragraph mark). Reading never adds elements to
+    the XML. Writes go to `a:defRPr` (added as needed) and any contradicting value on
+    `a:endParaRPr` is removed, so the paragraph properties remain authoritative.
+    """
+
+    def __init__(self, p: CT_TextParagraph):
+        # ---NOTE: Font.__init__() is intentionally skipped; this subclass is bound to---
+        # ---the paragraph element rather than to a concrete character-properties element---
+        super(Font, self).__init__()
+        self._p = p
+        self._fill_parent = _ParagraphFillParent(p)
+
+    @property
+    def bold(self) -> bool | None:
+        """Explicit bold value for this paragraph, None when inherited.
+
+        Read from `a:defRPr`, falling back to `a:endParaRPr`. Assigning |None| removes any
+        explicit setting, causing the effective value to be inherited.
+        """
+        return self._explicit("b")
+
+    @bold.setter
+    def bold(self, value: bool | None):
+        self._set_explicit("b", value)
+
+    @lazyproperty
+    def color(self) -> ColorFormat:
+        """The |ColorFormat| instance providing access to the color settings for this font.
+
+        Accessing this property never changes the XML. When no fill is specified, the
+        returned object reports a color type of |None| and an `a:solidFill` element is only
+        added (to `a:defRPr`) if and when a color value is assigned. When the font has a
+        non-solid fill, such as a gradient, a |TypeError| is raised; use :attr:`fill` to
+        access the fill in that case.
+        """
+        if self._fill_parent.eg_fillProperties is None:
+            return ColorFormat.from_colorchoice_parent(_DeferredSolidFill(self._fill_parent))
+        return self.fill.fore_color
+
+    @lazyproperty
+    def fill(self) -> FillFormat:
+        """|FillFormat| instance for this font, providing access to fill properties.
+
+        Reflects the fill of `a:defRPr`, or of `a:endParaRPr` when defRPr specifies none.
+        Changes are applied to `a:defRPr` and any fill on `a:endParaRPr` is removed.
+        """
+        return FillFormat.from_fill_parent(cast("BaseOxmlElement", self._fill_parent))
+
+    @property
+    def italic(self) -> bool | None:
+        """Explicit italic value for this paragraph, with the same behaviors as :attr:`bold`."""
+        return self._explicit("i")
+
+    @italic.setter
+    def italic(self, value: bool | None):
+        self._set_explicit("i", value)
+
+    @property
+    def language_id(self) -> MSO_LANGUAGE_ID | None:
+        """Explicit language id for this paragraph, read from defRPr or endParaRPr.
+
+        Assigning |None| or `MSO_LANGUAGE_ID.NONE` removes any language setting.
+        """
+        lang = self._explicit("lang")
+        if lang is None:
+            return MSO_LANGUAGE_ID.NONE
+        return lang
+
+    @language_id.setter
+    def language_id(self, value: MSO_LANGUAGE_ID | None):
+        if value == MSO_LANGUAGE_ID.NONE:
+            value = None
+        self._set_explicit("lang", value)
+
+    @property
+    def name(self) -> str | None:
+        """Explicit typeface name for this paragraph, read from defRPr or endParaRPr.
+
+        Assigning |None| removes any override of the inherited typeface.
+        """
+        for rPr in (self._defRPr, self._p.endParaRPr):
+            if rPr is not None and rPr.latin is not None:
+                return rPr.latin.typeface
+        return None
+
+    @name.setter
+    def name(self, value: str | None):
+        if value is None:
+            for rPr in (self._defRPr, self._p.endParaRPr):
+                if rPr is not None and rPr.latin is not None:
+                    rPr._remove_latin()  # pyright: ignore[reportPrivateUsage]
+            return
+        latin = self._get_or_add_defRPr().get_or_add_latin()
+        latin.typeface = value
+        endParaRPr = self._p.endParaRPr
+        if endParaRPr is not None and endParaRPr.latin is not None:
+            endParaRPr._remove_latin()  # pyright: ignore[reportPrivateUsage]
+
+    @property
+    def size(self) -> Length | None:
+        """Explicit font size for this paragraph, read from defRPr or endParaRPr.
+
+        |None| indicates the font size is inherited from the style hierarchy. Assigning
+        |None| removes any explicit size setting.
+        """
+        sz = self._explicit("sz")
+        if sz is None:
+            return None
+        return Centipoints(sz)
+
+    @size.setter
+    def size(self, emu: Length | None):
+        sz = None if emu is None else Emu(emu).centipoints
+        self._set_explicit("sz", sz)
+
+    @property
+    def underline(self) -> bool | MSO_TEXT_UNDERLINE_TYPE | None:
+        """Explicit underline setting for this paragraph, read from defRPr or endParaRPr."""
+        u = self._explicit("u")
+        if u is MSO_UNDERLINE.NONE:
+            return False
+        if u is MSO_UNDERLINE.SINGLE_LINE:
+            return True
+        return u
+
+    @underline.setter
+    def underline(self, value: bool | MSO_TEXT_UNDERLINE_TYPE | None):
+        if value is True:
+            value = MSO_UNDERLINE.SINGLE_LINE
+        elif value is False:
+            value = MSO_UNDERLINE.NONE
+        self._set_explicit("u", value)
+
+    def _explicit(self, attr_name: str):
+        """Value of `attr_name` from `a:defRPr`, falling back to `a:endParaRPr`.
+
+        None when neither element specifies the attribute. Never adds elements to the XML.
+        """
+        for rPr in (self._defRPr, self._p.endParaRPr):
+            if rPr is not None:
+                value = getattr(rPr, attr_name)
+                if value is not None:
+                    return value
+        return None
+
+    def _set_explicit(self, attr_name: str, value: object) -> None:
+        """Write `value` to `a:defRPr` and remove any contradicting value from `a:endParaRPr`.
+
+        `a:defRPr` is added as needed, except when `value` is None, which simply removes
+        any explicit setting without adding elements.
+        """
+        if value is None:
+            for rPr in (self._defRPr, self._p.endParaRPr):
+                if rPr is not None:
+                    setattr(rPr, attr_name, None)
+            return
+        setattr(self._get_or_add_defRPr(), attr_name, value)
+        endParaRPr = self._p.endParaRPr
+        if endParaRPr is not None:
+            setattr(endParaRPr, attr_name, None)
+
+    @property
+    def _defRPr(self) -> CT_TextCharacterProperties | None:
+        """The `a:defRPr` child of this paragraph's `a:pPr`, None when not present."""
+        pPr = self._p.pPr
+        if pPr is None:
+            return None
+        return pPr.defRPr
+
+    def _get_or_add_defRPr(self) -> CT_TextCharacterProperties:
+        """The `a:defRPr` element for this paragraph, added with its ancestors as needed."""
+        return self._p.get_or_add_pPr().get_or_add_defRPr()
+
+
 class _Hyperlink(Subshape):
     """Text run hyperlink object.
 
@@ -510,8 +840,13 @@ class _Paragraph(Subshape):
         These character properties override default properties inherited from parent objects such
         as the text frame the paragraph is contained in and they may be overridden by character
         properties set at the run level.
+
+        Values are read from `a:pPr/a:defRPr` when present, falling back to `a:endParaRPr`
+        (formatting applied to the paragraph mark); reading never adds elements to the XML.
+        Assigned values are written to `a:defRPr` and any contradicting value on `a:endParaRPr`
+        is removed.
         """
-        return Font(self._defRPr)
+        return _ParagraphFont(self._p)
 
     @property
     def level(self) -> int:
@@ -607,21 +942,17 @@ class _Paragraph(Subshape):
         If line-feed characters are intended to produce new paragraphs, use `TextFrame.text`
         instead. Any other control characters in the assigned string are escaped as a hex
         representation like "_x001B_" (for ESC (ASCII 27) in this example).
+
+        The replacement text inherits this paragraph's explicit character formatting, so
+        settings such as font size, bold, and color are retained when text is replaced.
         """
         return "".join(elm.text for elm in self._element.content_children)
 
     @text.setter
     def text(self, text: str):
+        self._promote_explicit_char_format()
         self.clear()
         self._element.append_text(text)
-
-    @property
-    def _defRPr(self) -> CT_TextCharacterProperties:
-        """The element that defines the default run properties for runs in this paragraph.
-
-        Causes the element to be added if not present.
-        """
-        return self._pPr.get_or_add_defRPr()
 
     @property
     def _pPr(self) -> CT_TextParagraphProperties:
@@ -630,6 +961,33 @@ class _Paragraph(Subshape):
         Causes the element to be added if not present.
         """
         return self._p.get_or_add_pPr()
+
+    def _promote_explicit_char_format(self):
+        """Copy this paragraph's explicit character formatting to `a:pPr/a:defRPr` when needed.
+
+        Runs added to replace this paragraph's content inherit their character formatting
+        from `a:defRPr`. When this paragraph carries explicit character formatting only on
+        its paragraph mark (`a:endParaRPr`) or on its first content item (run, line-break,
+        or field), that formatting is copied to `a:defRPr` so replacement text retains it.
+        Does nothing when `a:defRPr` is already present or the paragraph has no explicit
+        character formatting; in particular no elements are added for a paragraph having
+        no explicit formatting.
+        """
+        p = self._p
+        pPr = p.pPr
+        if pPr is not None and pPr.defRPr is not None:
+            return
+        source: CT_TextCharacterProperties | None = p.endParaRPr
+        if source is None:
+            content = p.content_children
+            source = content[0].rPr if content else None
+        if source is None or (not source.attrib and len(source) == 0):
+            return
+        defRPr = p.get_or_add_pPr().get_or_add_defRPr()
+        for name, value in source.attrib.items():
+            defRPr.set(name, value)
+        for child in source:
+            defRPr.append(copy.deepcopy(child))
 
 
 class _Run(Subshape):
